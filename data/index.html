@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ESP32 Radar</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <h1>ESP32 RADAR SYSTEM</h1>
+
+  <div id="canvas-container">
+    <canvas id="radarCanvas" width="1200" height="700"></canvas>
+  </div>
+
+  <div id="info">
+    <div>Angle: <span id="_ANGLE">0</span>°</div>
+    <div>Dist: <span id="_CM">0</span> cm</div>
+  </div>
+
+<script>
+  const canvas = document.getElementById("radarCanvas");
+  const ctx = canvas.getContext("2d");
+
+  const maxDistance = 40;
+
+  // servStep + latency
+  const STEP_MS = 130;
+
+  const ANGLE_MIN = 15;
+  const ANGLE_MAX = 165;
+
+  // data from ESP
+  let baseAngle = 90;
+  let baseDir = 1;
+  let lastDistance = 999;
+
+  // time sync
+  let espBaseTms = 0;
+  let espToPcOffset = 0; 
+
+  // detections history
+  const lastDistances = new Array(181).fill(null);
+  const holdFrames = new Array(181).fill(0);
+  const HOLD_MAX = 45;
+
+  const gateway = `ws://${window.location.hostname}/ws`;
+  let ws;
+
+  // keep last packet only
+  let lastMsg = null;
+
+  function connectWS() {
+    ws = new WebSocket(gateway);
+
+    ws.onopen  = () => console.log("WS connected");
+    ws.onclose = () => setTimeout(connectWS, 800);
+
+    ws.onmessage = (event) => {
+      lastMsg = event.data;
+    };
+  }
+
+  function applyLastMsg() {
+    if (!lastMsg) return;
+
+    const raw = lastMsg;
+    lastMsg = null;
+
+    let data;
+    try { data = JSON.parse(raw); } catch { return; }
+
+    const a   = (data.a ?? data.angle);
+    const d   = (data.d ?? data.distance);
+    const dir = (data.dir ?? 1);
+    const t   = (data.t ?? data.tms ?? 0);
+
+    if (typeof a === "number") baseAngle = a;
+    if (typeof d === "number") lastDistance = d;
+    baseDir = dir;
+
+    espBaseTms = t;
+    const newOffset = performance.now() - t;
+    espToPcOffset = espToPcOffset ? (espToPcOffset * 0.85 + newOffset * 0.15) : newOffset;
+
+    document.getElementById("_ANGLE").textContent = baseAngle;
+    document.getElementById("_CM").textContent = lastDistance;
+
+    if (lastDistance > 0 && lastDistance < maxDistance) {
+      const ang = Math.max(0, Math.min(180, Math.round(baseAngle)));
+      lastDistances[ang] = lastDistance;
+      holdFrames[ang] = HOLD_MAX;
+    }
+  }
+
+  function predictedAngle() {
+    // оцінюємо “поточний час ESP” на ПК
+    const pcNow = performance.now();
+    const estEspNow = pcNow - espToPcOffset;
+    const elapsedEspMs = estEspNow - espBaseTms;
+
+    let a = baseAngle + baseDir * (elapsedEspMs / STEP_MS);
+    if (a > ANGLE_MAX) a = ANGLE_MAX;
+    if (a < ANGLE_MIN) a = ANGLE_MIN;
+    return a;
+  }
+
+  function animate() {
+    applyLastMsg();
+    drawRadar(predictedAngle());
+    requestAnimationFrame(animate);
+  }
+
+  function drawRadar(sweepAngle) {
+    ctx.fillStyle = "rgba(0,0,0,0.06)";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    ctx.save();
+    ctx.translate(canvas.width / 2, canvas.height - canvas.height * 0.074);
+
+    drawGrid();
+    drawDetections();
+    drawSweepBeam(sweepAngle);
+
+    ctx.restore();
+    drawBottomLabels();
+  }
+
+  function drawGrid() {
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "rgb(98,245,31)";
+
+    const arcs = [0.0625, 0.27, 0.479, 0.687];
+    arcs.forEach(r => {
+      ctx.beginPath();
+      ctx.arc(0, 0, (canvas.width - canvas.width * r) / 2, Math.PI, 2 * Math.PI);
+      ctx.stroke();
+    });
+
+    const angles = [30, 60, 90, 120, 150];
+    angles.forEach(a => {
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      const x = (-canvas.width/2) * Math.cos(a * Math.PI/180);
+      const y = (-canvas.width/2) * Math.sin(a * Math.PI/180);
+      ctx.lineTo(x, y);
+      ctx.stroke();
+    });
+  }
+
+  function drawDetections() {
+    ctx.lineWidth = 20;
+    ctx.strokeStyle = "rgb(255,10,10)";
+
+    for (let ang = 0; ang <= 180; ang++) {
+      if (holdFrames[ang] > 0) holdFrames[ang]--;
+
+      const d = lastDistances[ang];
+      if (d == null) continue;
+
+      if (holdFrames[ang] <= 0) {
+        lastDistances[ang] = null;
+        continue;
+      }
+
+      const pix = d * ((canvas.height - canvas.height * 0.1666) * 0.025);
+      const seg = 18;
+      const rad = ang * Math.PI/180;
+
+      const x1 = (pix - seg) * Math.cos(rad);
+      const y1 = -(pix - seg) * Math.sin(rad);
+      const x2 = (pix + seg) * Math.cos(rad);
+      const y2 = -(pix + seg) * Math.sin(rad);
+
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+    }
+  }
+
+  // beam (залишив твій стиль як був)
+  function drawSweepBeam(sweepAngle) {
+    const len = canvas.height - canvas.height * 0.12;
+    const rad = sweepAngle * Math.PI / 180;
+    const x = len * Math.cos(rad);
+    const y = -len * Math.sin(rad);
+
+    ctx.save();
+    ctx.globalAlpha = 0.4;
+    ctx.lineWidth = 12;
+    ctx.strokeStyle = "rgb(30,250,60)";
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(x, y);
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.save();
+    ctx.globalAlpha = 0.15;
+    ctx.lineWidth = 12;
+    ctx.strokeStyle = "rgb(30,250,60)";
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(x, y);
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.save();
+    ctx.globalAlpha = 1.0;
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = "rgb(98,245,31)";
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(x, y);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawBottomLabels() {
+    ctx.fillStyle = "rgb(0,0,0)";
+    ctx.fillRect(0, canvas.height - canvas.height * 0.0648, canvas.width, canvas.height);
+
+    ctx.fillStyle = "rgb(98,245,31)";
+    ctx.font = "25px Arial";
+    ctx.fillText("10cm", canvas.width - canvas.width * 0.3854, canvas.height - 12);
+    ctx.fillText("20cm", canvas.width - canvas.width * 0.281,  canvas.height - 12);
+    ctx.fillText("30cm", canvas.width - canvas.width * 0.177,  canvas.height - 12);
+    ctx.fillText("40cm", canvas.width - canvas.width * 0.0729, canvas.height - 12);
+  }
+
+  ctx.fillStyle = "black";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  window.onload = () => {
+    connectWS();
+    requestAnimationFrame(animate);
+  };
+</script>
+</body>
+</html>
