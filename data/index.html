@@ -411,9 +411,9 @@ function drawSweepBeam(angle) {
         ctx.save();
         ctx.globalAlpha = alpha;
         ctx.strokeStyle = "rgb(30,250,60)";
-        ctx.lineWidth   = 8 + (i / trail.length) * 4;
+        ctx.lineWidth   = 8 + (i / trail.length) * 2;//4
         ctx.shadowColor = "#00ff44";
-        ctx.shadowBlur  = 10;
+        ctx.shadowBlur  = 6;//10
         ctx.beginPath();
         ctx.moveTo(0, 0);
         ctx.lineTo(MAX_RADIUS * Math.cos(a), -MAX_RADIUS * Math.sin(a));
@@ -425,7 +425,7 @@ function drawSweepBeam(angle) {
     const rad = angle * Math.PI / 180;
     ctx.save();
     ctx.globalAlpha = 1.0;
-    ctx.lineWidth   = 3;
+    ctx.lineWidth   = 2;//3
     ctx.strokeStyle = "rgb(98,245,31)";
     ctx.shadowColor = "#62f51f";
     ctx.shadowBlur  = 14;
