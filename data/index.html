@@ -8,280 +8,538 @@
 </head>
 <body>
   <h1>ESP32 RADAR SYSTEM</h1>
-  <div id="ws-status">⬤ CONNECTING...</div>
+  <div id="ws-status">&#x2B24; CONNECTING...</div>
 
   <div id="canvas-container">
-    <canvas id="radarCanvas" width="1200" height="700"></canvas>
+    <!-- Основний canvas радара. Розміри встановлюються динамічно через JS -->
+    <canvas id="radarCanvas"></canvas>
   </div>
 
   <div id="info">
-    <div>Angle: <span id="_ANGLE">—</span>°</div>
-    <div>Dist:  <span id="_CM">—</span> cm</div>
+    <div>Angle: <span id="_ANGLE">&#8212;</span>&#176;</div>
+    <div>Dist:&nbsp; <span id="_CM">&#8212;</span> cm</div>
     <div id="alert-box"></div>
   </div>
 
+  <!-- Теплова карта — акумулює всі виявлення за сесію -->
+  <div id="heatmap-section">
+    <div id="heatmap-header">
+      <span id="heatmap-label">SCAN HISTORY</span>
+      <button id="clearHeatmap">CLEAR</button>
+    </div>
+    <canvas id="heatmapCanvas"></canvas>
+  </div>
+
 <script>
+// ═══════════════════════════════════════════════════════════════════════════
+// КОНСТАНТИ (повинні збігатися з відповідними значеннями у прошивці)
+// ═══════════════════════════════════════════════════════════════════════════
+const MAX_DIST_CM      = 40;   // максимальна відстань відображення (см)
+const ANGLE_MIN        = 15;   // мінімальний кут сервомотора
+const ANGLE_MAX        = 165;  // максимальний кут сервомотора
+const STEP_MS          = 65;   // період кроку сервомотора (мс) = servoStepPeriodMs
+const HOLD_FRAMES      = 60;   // кадрів утримання детекції (~1 с при 60fps)
+const ZONE_CRITICAL_CM = 15;   // поріг критичної зони (мають збігатись з прошивкою)
+const ZONE_WARNING_CM  = 35;   // поріг зони попередження
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CANVAS — РАДАР (адаптивний розмір)
+// ═══════════════════════════════════════════════════════════════════════════
 const canvas = document.getElementById("radarCanvas");
 const ctx    = canvas.getContext("2d");
 
-const MAX_DIST_CM   = 40;
-const ANGLE_MIN     = 15;
-const ANGLE_MAX     = 165;
-const STEP_MS       = 50;          // повинен збігатися з servoStepPeriodMs
-const OBSTACLE_CM   = 35;
-const HOLD_FRAMES   = 60;          // ~1с при 60fps
+// Ці змінні перераховуються при кожній зміні розміру вікна
+let CW, CH, MAX_RADIUS, ORIGIN_Y;
 
-// ── стан ──
-let baseAngle     = 90;
-let baseDir       = 1;
-let espBaseTms    = 0;
-let espToPcOffset = 0;
+// ═══════════════════════════════════════════════════════════════════════════
+// CANVAS — ТЕПЛОВА КАРТА
+// ═══════════════════════════════════════════════════════════════════════════
+const hcv  = document.getElementById("heatmapCanvas");
+const hctx = hcv.getContext("2d");
 
-// плавний sweep (lerp)
-let displayAngle  = 90;
+// ═══════════════════════════════════════════════════════════════════════════
+// АДАПТИВНИЙ РОЗМІР CANVAS (Ідея 11)
+//
+// Розмір основного canvas підлаштовується під ширину вікна браузера.
+// Теплова карта займає 1/3 від ширини основного canvas.
+// При зміні розміру вікна (resize) всі параметри перераховуються автоматично.
+// ═══════════════════════════════════════════════════════════════════════════
+function resizeCanvas() {
+    const ASPECT = 12 / 7;
+    const maxW   = Math.min(window.innerWidth * 0.96, 1200);
+    CW = Math.round(maxW);
+    CH = Math.round(CW / ASPECT);
 
-// trail: масив останніх кутів з alpha
+    canvas.width  = CW;
+    canvas.height = CH;
+
+    // Центр системи координат — нижня точка напівкола радара
+    ORIGIN_Y   = CH - Math.round(CH * 0.074);
+    MAX_RADIUS = (CW / 2) - 10;
+
+    // Теплова карта: пропорційна, завжди 1/3 від ширини радара
+    const HW = Math.round(CW / 3);
+    const HH = Math.round(HW * 0.6);
+    hcv.width  = HW;
+    hcv.height = HH;
+    initHeatmap();  // перемалювати сітку теплової карти
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// СТАН РАДАРА
+// ═══════════════════════════════════════════════════════════════════════════
+let baseAngle     = 90;   // кут останнього пакету від ESP32
+let baseDir       = 1;    // напрямок розгортки (+1 або -1)
+let espBaseTms    = 0;    // час ESP32 в момент останнього пакету
+let espToPcOffset = 0;    // зміщення між millis() ESP32 та performance.now() браузера
+let displayAngle  = 90;   // поточний відображуваний кут (lerp)
+
+// Слід — масив останніх кутів для ефекту "світного сліду" за проміней
 const TRAIL_LEN = 18;
 const trail = [];
 
-// детекції
-const detDist   = new Array(181).fill(null);
-const detHold   = new Array(181).fill(0);
-const detAlpha  = new Array(181).fill(0);
+// Масиви детекцій (індекс = кут 0..180)
+const detDist  = new Array(181).fill(null);  // відстань (см або null)
+const detHold  = new Array(181).fill(0);     // залишок кадрів утримання
+const detAlpha = new Array(181).fill(0);     // прозорість (0..1)
+const detZone  = new Array(181).fill(0);     // зона (0/1/2)
 
-// WS
+// ═══════════════════════════════════════════════════════════════════════════
+// ВІДСТЕЖЕННЯ РУХУ ОБ'ЄКТІВ (Ідея 4)
+//
+// Принцип: після кожної повної розгортки (зміна напрямку dir)
+// порівнюємо відстані до об'єктів у поточній та попередній розгортці.
+// Якщо об'єкт на куті A змінив відстань більш ніж на 5 см:
+//   • відстань зменшилась → об'єкт НАБЛИЖАЄТЬСЯ (стрілка пурпурного кольору)
+//   • відстань збільшилась → об'єкт ВІДДАЛЯЄТЬСЯ (стрілка блакитного кольору)
+// Стрілка відображається протягом 2×HOLD_FRAMES кадрів, потім зникає.
+// ═══════════════════════════════════════════════════════════════════════════
+const prevScanDist = new Array(181).fill(null); // дані попередньої розгортки
+const motionState  = new Array(181).fill(0);    // -1 наближ., 0 статика, +1 віддал.
+const motionHold   = new Array(181).fill(0);    // залишок кадрів стрілки
+let   lastSweepDir = null;                      // напрямок попередньої розгортки
+
+/**
+ * Аналіз руху: порівнює поточну розгортку з попередньою.
+ * Викликається автоматично при кожній зміні напрямку сканування.
+ * Поріг 5 см усуває хибні спрацювання від шуму датчика.
+ */
+function analyzeMotion() {
+    for (let a = ANGLE_MIN; a <= ANGLE_MAX; a++) {
+        if (detDist[a] !== null && prevScanDist[a] !== null) {
+            const delta = detDist[a] - prevScanDist[a];
+            if (Math.abs(delta) > 5) {
+                motionState[a] = delta > 0 ? 1 : -1;
+                motionHold[a]  = HOLD_FRAMES * 2;
+            }
+        } else if (motionHold[a] <= 0) {
+            motionState[a] = 0;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WEBSOCKET З EXPONENTIAL BACKOFF (Issue 8)
+//
+// При розриві з'єднання браузер повторює спробу з подвоєнням затримки:
+//   800 мс → 1600 мс → 3200 мс → 6400 мс → 10000 мс (максимум).
+// Це запобігає "спаму" до ESP32 при тривалій відсутності пристрою.
+// При успішному з'єднанні затримка скидається до початкового значення.
+// ═══════════════════════════════════════════════════════════════════════════
 const gateway = `ws://${window.location.hostname}/ws`;
 let ws, lastMsg = null;
-const statusEl   = document.getElementById("ws-status");
-const alertEl    = document.getElementById("alert-box");
+let reconnectDelay = 800;
+const MAX_RECONNECT_MS = 10000;
+
+const statusEl = document.getElementById("ws-status");
+const alertEl  = document.getElementById("alert-box");
 
 function connectWS() {
-  ws = new WebSocket(gateway);
-  ws.onopen    = () => { statusEl.textContent = "⬤ CONNECTED";  statusEl.style.color = "#62f51f"; };
-  ws.onclose   = () => { statusEl.textContent = "⬤ OFFLINE";    statusEl.style.color = "#f00"; setTimeout(connectWS, 800); };
-  ws.onmessage = (e) => { lastMsg = e.data; };
+    ws = new WebSocket(gateway);
+    ws.onopen = () => {
+        statusEl.textContent = "\u2B24 CONNECTED";
+        statusEl.style.color = "#62f51f";
+        reconnectDelay = 800;  // скидаємо після успішного з'єднання
+    };
+    ws.onclose = () => {
+        statusEl.textContent = "\u2B24 OFFLINE";
+        statusEl.style.color = "#f00";
+        setTimeout(connectWS, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_MS);
+    };
+    ws.onmessage = (e) => { lastMsg = e.data; };
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ОБРОБКА ВХІДНИХ ДАНИХ
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Парсить останній JSON-пакет від ESP32 і оновлює стан.
+ *
+ * Поля пакету: a (кут), d (відстань), dir (напрямок), t (час), z (зона).
+ * Поле z: 0=безпечно, 1=попередження, 2=критично.
+ * Якщо прошивка стара і не містить "z" — обчислюємо самостійно.
+ *
+ * ВИПРАВЛЕННЯ (Issue 10): alertEl.textContent оновлюється ЗАВЖДИ,
+ * а не лише при виявленні об'єкта в зоні MAX_DIST_CM. Це гарантує
+ * що попередження зникає одразу як тільки загрози немає.
+ */
 function applyLastMsg() {
-  if (!lastMsg) return;
-  const raw = lastMsg; lastMsg = null;
+    if (!lastMsg) return;
+    const raw = lastMsg; lastMsg = null;
 
-  let data;
-  try { data = JSON.parse(raw); } catch { return; }
+    let data;
+    try { data = JSON.parse(raw); } catch { return; }
 
-  const a   = data.a   ?? data.angle    ?? baseAngle;
-  const d   = data.d   ?? data.distance ?? 999;
-  const dir = data.dir ?? 1;
-  const t   = data.t   ?? data.tms      ?? 0;
+    const a   = data.a   ?? baseAngle;
+    const d   = data.d   ?? 999;
+    const dir = data.dir ?? 1;
+    const t   = data.t   ?? 0;
+    // Зворотна сумісність: якщо поле z відсутнє — обчислюємо за порогами
+    const z   = data.z   ?? (d >= 999 ? 0 : d < ZONE_CRITICAL_CM ? 2 : d < ZONE_WARNING_CM ? 1 : 0);
 
-  baseAngle = a;
-  baseDir   = dir;
+    baseAngle = a;
+    baseDir   = dir;
 
-  // синхронізація часу (EWMA)
-  espBaseTms = t;
-  const raw_offset = performance.now() - t;
-  espToPcOffset = espToPcOffset
-    ? espToPcOffset * 0.9 + raw_offset * 0.1
-    : raw_offset;
+    // Синхронізація часу: EWMA з коефіцієнтом 0.25 для швидшої адаптації
+    // при зміні затримки мережі (попередньо було 0.1 — дуже повільно).
+    espBaseTms    = t;
+    const rawOff  = performance.now() - t;
+    espToPcOffset = espToPcOffset
+        ? espToPcOffset * 0.75 + rawOff * 0.25
+        : rawOff;
 
-  document.getElementById("_ANGLE").textContent = a;
-  document.getElementById("_CM").textContent    = d < 999 ? d : "—";
+    document.getElementById("_ANGLE").textContent = a;
+    document.getElementById("_CM").textContent    = d < 999 ? d : "\u2014";
 
-  // зберегти детекцію
-  if (d > 0 && d < MAX_DIST_CM) {
-    const ang = Math.max(0, Math.min(180, Math.round(a)));
-    detDist[ang]  = d;
-    detHold[ang]  = HOLD_FRAMES;
-    detAlpha[ang] = 1.0;
-
-    // UI alert
-    if (d < OBSTACLE_CM) {
-      alertEl.textContent = `⚠ OBSTACLE at ${d} cm`;
-      alertEl.style.color = "#f55";
+    // ── Виправлення alert (Issue 10) ────────────────────────────────────
+    // Оновлюємо alert при КОЖНОМУ пакеті (не тільки при виявленні об'єкта).
+    // Три зони (Ідея 1): критична — червоний, попередження — помаранчевий,
+    // безпечно — очищаємо текст (мерехтіння зупиняється).
+    if (z === 2) {
+        alertEl.textContent = `!! CRITICAL  ${d} cm`;
+        alertEl.style.color = "#ff2222";
+    } else if (z === 1) {
+        alertEl.textContent = `~  WARNING   ${d} cm`;
+        alertEl.style.color = "#ff8800";
     } else {
-      alertEl.textContent = "";
+        alertEl.textContent = "";
     }
-  }
+
+    // Зберегти детекцію (тільки в межах зони відображення)
+    if (d > 0 && d < MAX_DIST_CM) {
+        const ang = Math.max(0, Math.min(180, Math.round(a)));
+        detDist[ang]  = d;
+        detHold[ang]  = HOLD_FRAMES;
+        detAlpha[ang] = 1.0;
+        detZone[ang]  = z;
+        addHeatmapPoint(ang, d, z);
+    }
+
+    // ── Аналіз руху при зміні напрямку розгортки ───────────────────────
+    if (lastSweepDir !== null && dir !== lastSweepDir) {
+        analyzeMotion();
+        // Копіюємо поточну розгортку для наступного порівняння
+        for (let i = 0; i <= 180; i++) prevScanDist[i] = detDist[i];
+    }
+    lastSweepDir = dir;
 }
 
-// передбачуваний кут з інтерполяцією
+// ── Передбачення кута з інтерполяцією ────────────────────────────────────
 function predictedAngle() {
-  const estEsp = performance.now() - espToPcOffset;
-  const elapsed = estEsp - espBaseTms;
-  let a = baseAngle + baseDir * (elapsed / STEP_MS);
-  return Math.max(ANGLE_MIN, Math.min(ANGLE_MAX, a));
+    const estEsp  = performance.now() - espToPcOffset;
+    const elapsed = estEsp - espBaseTms;
+    const a = baseAngle + baseDir * (elapsed / STEP_MS);
+    return Math.max(ANGLE_MIN, Math.min(ANGLE_MAX, a));
 }
 
-// ── малювання ──
+// ═══════════════════════════════════════════════════════════════════════════
+// ФУНКЦІЇ ВІДОБРАЖЕННЯ
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Перетворює кут (градуси) та радіус (пікселі) у координати (x, y)
+ * відносно центру радара. Вісь Y інвертована (canvas: Y зростає вниз).
+ */
 function toXY(angleDeg, radiusPx) {
-  const r = angleDeg * Math.PI / 180;
-  return [radiusPx * Math.cos(r), -radiusPx * Math.sin(r)];
+    const r = angleDeg * Math.PI / 180;
+    return [radiusPx * Math.cos(r), -radiusPx * Math.sin(r)];
 }
 
-const CW = canvas.width;
-const CH = canvas.height;
-const ORIGIN_Y   = CH - CH * 0.074;
-const MAX_RADIUS = (CW / 2) - 10;
-
-// радіус для дистанції в пікселях
 function distToPx(cm) {
-  return cm * (MAX_RADIUS / MAX_DIST_CM);
+    return cm * (MAX_RADIUS / MAX_DIST_CM);
 }
 
+// ── Сітка ─────────────────────────────────────────────────────────────────
 function drawGrid() {
-  ctx.strokeStyle = "rgba(98,245,31,0.55)";
-  ctx.lineWidth   = 1.2;
+    ctx.strokeStyle = "rgba(98,245,31,0.55)";
+    ctx.lineWidth   = 1.2;
 
-  // кільця через 10 см
-  for (let d = 10; d <= MAX_DIST_CM; d += 10) {
-    const r = distToPx(d);
-    ctx.beginPath();
-    ctx.arc(0, 0, r, Math.PI, 2 * Math.PI);
-    ctx.stroke();
-  }
+    // Концентричні напівкола через 10 см
+    for (let d = 10; d <= MAX_DIST_CM; d += 10) {
+        const r = distToPx(d);
+        ctx.beginPath();
+        ctx.arc(0, 0, r, Math.PI, 2 * Math.PI);
+        ctx.stroke();
+    }
 
-  // промені через 30°
-  for (let a = 30; a <= 150; a += 30) {
-    const [x, y] = toXY(a, MAX_RADIUS);
-    ctx.beginPath();
-    ctx.moveTo(0, 0);
-    ctx.lineTo(x, y);
-    ctx.stroke();
-  }
+    // Радіальні промені через 30°
+    for (let a = 30; a <= 150; a += 30) {
+        const [x, y] = toXY(a, MAX_RADIUS);
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(x, y);
+        ctx.stroke();
+    }
 
-  // підписи кілець
-  ctx.fillStyle = "rgba(98,245,31,0.7)";
-  ctx.font = "bold 14px 'Courier New', monospace";
-  ctx.textAlign = "center";
-  for (let d = 10; d <= MAX_DIST_CM; d += 10) {
-    const r = distToPx(d);
-    ctx.fillText(`${d}cm`, -r - 6, 16);
-  }
+    // Підписи відстаней — масштабований шрифт (clamp)
+    const fsize = Math.max(10, Math.round(CW * 0.012));
+    ctx.fillStyle = "rgba(98,245,31,0.7)";
+    ctx.font = `bold ${fsize}px 'Courier New', monospace`;
+    ctx.textAlign = "center";
+    for (let d = 10; d <= MAX_DIST_CM; d += 10) {
+        const r = distToPx(d);
+        ctx.fillText(`${d}cm`, -r - 6, 16);
+    }
 
-  // підписи кутів
-  ctx.font = "13px 'Courier New', monospace";
-  for (const a of [30, 60, 90, 120, 150]) {
-    const [x, y] = toXY(a, MAX_RADIUS + 18);
-    ctx.fillText(`${a}°`, x, y + 5);
-  }
+    // Підписи кутів
+    ctx.font = `${Math.max(9, Math.round(CW * 0.011))}px 'Courier New', monospace`;
+    for (const a of [30, 60, 90, 120, 150]) {
+        const [x, y] = toXY(a, MAX_RADIUS + 18);
+        ctx.fillText(`${a}\u00b0`, x, y + 5);
+    }
 }
 
+// ── Детекції та стрілки руху ──────────────────────────────────────────────
+/**
+ * Малює виявлені об'єкти на полотні радара.
+ *
+ * КОЛЬОРОВА СХЕМА ЗА ЗОНАМИ (Ідея 1):
+ *   Зона 2 (критична) — червоний   (#ff2222), товщина 22px
+ *   Зона 1 (попередження) — помаранч. (#ff6633), товщина 16px
+ *   Зона 0 (безпечно)  — зелений   (#62f51f), товщина 12px
+ *
+ * СТРІЛКИ РУХУ (Ідея 4):
+ *   Пурпурний (#ff44ff) — об'єкт наближається (відстань зменшується)
+ *   Блакитний (#44ffff) — об'єкт віддаляється (відстань збільшується)
+ *   Наконечник стрілки вказує напрямок руху вздовж радіального променя.
+ */
 function drawDetections() {
-  for (let ang = 0; ang <= 180; ang++) {
-    if (detHold[ang] > 0) {
-      detHold[ang]--;
-      // плавне затухання в останніх 20 кадрах
-      if (detHold[ang] < 20) {
-        detAlpha[ang] = detHold[ang] / 20;
-      }
+    for (let ang = 0; ang <= 180; ang++) {
+        if (detHold[ang] > 0) {
+            detHold[ang]--;
+            // Плавне затухання в останніх 20 кадрах
+            if (detHold[ang] < 20) detAlpha[ang] = detHold[ang] / 20;
+        }
+        if (!detDist[ang] || detHold[ang] <= 0) {
+            detDist[ang] = null;
+            continue;
+        }
+
+        const d   = detDist[ang];
+        const z   = detZone[ang];
+        const px  = distToPx(d);
+        const seg = 14;
+
+        const [x1, y1] = toXY(ang, px - seg);
+        const [x2, y2] = toXY(ang, px + seg);
+
+        // Колір і товщина лінії залежать від зони
+        const color = z === 2 ? "#ff2222" : z === 1 ? "#ff6633" : "#62f51f";
+        const glow  = z === 2 ? "#ff0000" : z === 1 ? "#ff4400" : "#40dd00";
+        const lw    = z === 2 ? 22        : z === 1 ? 16        : 12;
+
+        ctx.save();
+        ctx.globalAlpha = detAlpha[ang];
+        ctx.strokeStyle = color;
+        ctx.lineWidth   = lw;
+        ctx.shadowColor = glow;
+        ctx.shadowBlur  = 12;
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.stroke();
+        ctx.restore();
+
+        // ── Стрілка напрямку руху ─────────────────────────────────────
+        if (motionState[ang] !== 0 && motionHold[ang] > 0) {
+            motionHold[ang]--;
+            const mDir  = motionState[ang];  // -1 наближ., +1 відд.
+            const alpha = Math.min(1, motionHold[ang] / 20);
+
+            // Стрілка направлена вздовж радіусу:
+            // наближення → вказує до центру (кінець ближчий до 0)
+            // віддалення → вказує від центру (кінець далі від 0)
+            const [mx1, my1] = toXY(ang, px + mDir * 22);
+            const [mx2, my2] = toXY(ang, px - mDir * 8);
+
+            // Наконечник стрілки (дві коротких лінії під кутом ±0.4 рад)
+            const headLen = 7;
+            const headAng = Math.atan2(my2 - my1, mx2 - mx1);
+
+            ctx.save();
+            ctx.globalAlpha = alpha;
+            ctx.strokeStyle = mDir < 0 ? "#ff44ff" : "#44ffff";
+            ctx.lineWidth   = 2.5;
+            ctx.shadowColor = mDir < 0 ? "#ff00ff" : "#00ffff";
+            ctx.shadowBlur  = 8;
+            ctx.beginPath();
+            ctx.moveTo(mx1, my1);
+            ctx.lineTo(mx2, my2);
+            ctx.lineTo(mx2 - headLen * Math.cos(headAng - 0.4),
+                       my2 - headLen * Math.sin(headAng - 0.4));
+            ctx.moveTo(mx2, my2);
+            ctx.lineTo(mx2 - headLen * Math.cos(headAng + 0.4),
+                       my2 - headLen * Math.sin(headAng + 0.4));
+            ctx.stroke();
+            ctx.restore();
+        }
     }
-
-    if (!detDist[ang] || detHold[ang] <= 0) {
-      detDist[ang] = null;
-      continue;
-    }
-
-    const d = detDist[ang];
-    const px = distToPx(d);
-    const seg = 14;
-
-    const [x1, y1] = toXY(ang, px - seg);
-    const [x2, y2] = toXY(ang, px + seg);
-
-    ctx.save();
-    ctx.globalAlpha = detAlpha[ang];
-    ctx.strokeStyle = d < OBSTACLE_CM ? "#ff2222" : "#ff6633";
-    ctx.lineWidth   = d < OBSTACLE_CM ? 22 : 16;
-    ctx.shadowColor = d < OBSTACLE_CM ? "#ff0000" : "#ff4400";
-    ctx.shadowBlur  = 12;
-    ctx.beginPath();
-    ctx.moveTo(x1, y1);
-    ctx.lineTo(x2, y2);
-    ctx.stroke();
-    ctx.restore();
-  }
 }
 
+// ── Промінь розгортки ─────────────────────────────────────────────────────
 function drawSweepBeam(angle) {
-  // оновити trail
-  trail.push(angle);
-  if (trail.length > TRAIL_LEN) trail.shift();
+    // Оновити trail (черга кутів)
+    trail.push(angle);
+    if (trail.length > TRAIL_LEN) trail.shift();
 
-  // намалювати trail (згасаючий слід)
-  for (let i = 0; i < trail.length; i++) {
-    const a = trail[i] * Math.PI / 180;
-    const alpha = (i / trail.length) * 0.25;
-    const len   = MAX_RADIUS;
+    // Промальовка trail: ранні елементи прозоріші та тонші
+    for (let i = 0; i < trail.length; i++) {
+        const a     = trail[i] * Math.PI / 180;
+        const alpha = (i / trail.length) * 0.25;
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.strokeStyle = "rgb(30,250,60)";
+        ctx.lineWidth   = 8 + (i / trail.length) * 4;
+        ctx.shadowColor = "#00ff44";
+        ctx.shadowBlur  = 10;
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(MAX_RADIUS * Math.cos(a), -MAX_RADIUS * Math.sin(a));
+        ctx.stroke();
+        ctx.restore();
+    }
 
+    // Основний яскравий промінь
+    const rad = angle * Math.PI / 180;
     ctx.save();
-    ctx.globalAlpha  = alpha;
-    ctx.strokeStyle  = "rgb(30,250,60)";
-    ctx.lineWidth    = 8 + (i / trail.length) * 4;
-    ctx.shadowColor  = "#00ff44";
-    ctx.shadowBlur   = 10; // 18
+    ctx.globalAlpha = 1.0;
+    ctx.lineWidth   = 3;
+    ctx.strokeStyle = "rgb(98,245,31)";
+    ctx.shadowColor = "#62f51f";
+    ctx.shadowBlur  = 14;
     ctx.beginPath();
     ctx.moveTo(0, 0);
-    ctx.lineTo(len * Math.cos(a), -len * Math.sin(a));
+    ctx.lineTo(MAX_RADIUS * Math.cos(rad), -MAX_RADIUS * Math.sin(rad));
     ctx.stroke();
     ctx.restore();
-  }
-
-  // основний промінь
-  const rad = angle * Math.PI / 180;
-  const len  = MAX_RADIUS;
-
-  ctx.save();
-  ctx.globalAlpha = 1.0;
-  ctx.lineWidth   = 3;
-  ctx.strokeStyle = "rgb(98,245,31)";
-  ctx.shadowColor = "#62f51f";
-  ctx.shadowBlur  = 14; //14
-  ctx.beginPath();
-  ctx.moveTo(0, 0);
-  ctx.lineTo(len * Math.cos(rad), -len * Math.sin(rad));
-  ctx.stroke();
-  ctx.restore();
 }
 
+// ── Головний кадр ─────────────────────────────────────────────────────────
 function drawFrame(angle) {
-  // темний fade замість повного очищення → лишає слід
-  ctx.fillStyle = "rgba(0,0,0,0.12)";
-  ctx.fillRect(0, 0, CW, CH);
+    // Темний fade замість повного очищення → залишає "фосфорний" слід
+    ctx.fillStyle = "rgba(0,0,0,0.12)";
+    ctx.fillRect(0, 0, CW, CH);
 
-  ctx.save();
-  ctx.translate(CW / 2, ORIGIN_Y);
-
-  drawGrid();
-  drawDetections();
-  drawSweepBeam(angle);
-
-  ctx.restore();
+    ctx.save();
+    ctx.translate(CW / 2, ORIGIN_Y);
+    drawGrid();
+    drawDetections();
+    drawSweepBeam(angle);
+    ctx.restore();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ТЕПЛОВА КАРТА — SCAN HISTORY (Ідея 13)
+//
+// Теплова карта акумулює всі виявлення за сесію — точки НЕ зникають
+// (на відміну від основного радара де вони згасають через HOLD_FRAMES).
+// Це дозволяє аналізувати "гарячі зони" — місця де об'єкти з'являються
+// найчастіше. Кнопка CLEAR очищує карту вручну.
+//
+// Кольорове кодування точок:
+//   Червоний  — критична зона (< 15 см)
+//   Помаранч. — зона попередження (< 35 см)
+//   Зелений   — безпечна зона
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Малює сітку теплової карти (викликається при ініціалізації та resize). */
+function initHeatmap() {
+    const HW = hcv.width, HH = hcv.height;
+    const HR = (HW / 2) - 4;
+    const HOY = HH - 4;
+
+    hctx.fillStyle = "#000";
+    hctx.fillRect(0, 0, HW, HH);
+
+    hctx.strokeStyle = "rgba(98,245,31,0.3)";
+    hctx.lineWidth   = 0.8;
+
+    for (let d = 10; d <= MAX_DIST_CM; d += 10) {
+        const r = d * (HR / MAX_DIST_CM);
+        hctx.beginPath();
+        hctx.arc(HW / 2, HOY, r, Math.PI, 2 * Math.PI);
+        hctx.stroke();
+    }
+    // Базова горизонтальна лінія
+    hctx.beginPath();
+    hctx.moveTo(4, HOY);
+    hctx.lineTo(HW - 4, HOY);
+    hctx.stroke();
+}
+
+/** Додає одну точку виявлення на теплову карту. */
+function addHeatmapPoint(ang, dist, zone) {
+    const HW  = hcv.width, HH = hcv.height;
+    const HR  = (HW / 2) - 4;
+    const HOY = HH - 4;
+    const r   = dist * (HR / MAX_DIST_CM);
+    const rad = ang * Math.PI / 180;
+    const x   = HW / 2 + r * Math.cos(rad);
+    const y   = HOY    - r * Math.sin(rad);
+
+    hctx.beginPath();
+    hctx.arc(x, y, 3, 0, 2 * Math.PI);
+    hctx.fillStyle = zone === 2 ? "rgba(255,30,30,0.45)"  :
+                     zone === 1 ? "rgba(255,130,0,0.35)"  :
+                                  "rgba(40,255,80,0.25)";
+    hctx.fill();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// АНІМАЦІЙНИЙ ЦИКЛ
+// ═══════════════════════════════════════════════════════════════════════════
 function animate() {
-  applyLastMsg();
+    applyLastMsg();
 
-  // lerp displayAngle до predicted — плавний рух без стрибків
-  const target = predictedAngle();
-  const diff   = target - displayAngle;
-  // якщо стрибок > 5° (реверс або великий gap) — snap одразу
-  if (Math.abs(diff) > 8) {
-    displayAngle = target;
-  } else {
-    displayAngle += diff * 0.35;
-  }
+    // Lerp displayAngle до predictedAngle — плавний рух без стрибків
+    const target = predictedAngle();
+    const diff   = target - displayAngle;
+    // Snap при великому відхиленні (> 8°) — реверс напрямку або великий gap
+    if (Math.abs(diff) > 8) {
+        displayAngle = target;
+    } else {
+        displayAngle += diff * 0.35;
+    }
 
-  drawFrame(displayAngle);
-  requestAnimationFrame(animate);
+    drawFrame(displayAngle);
+    requestAnimationFrame(animate);
 }
 
-// старт
-ctx.fillStyle = "black";
-ctx.fillRect(0, 0, CW, CH);
+// ═══════════════════════════════════════════════════════════════════════════
+// ІНІЦІАЛІЗАЦІЯ
+// ═══════════════════════════════════════════════════════════════════════════
+window.addEventListener("resize", resizeCanvas);
+
+document.getElementById("clearHeatmap").addEventListener("click", () => {
+    initHeatmap();
+});
 
 window.onload = () => {
-  connectWS();
-  requestAnimationFrame(animate);
+    resizeCanvas();   // встановлює розміри canvas і малює сітку теплової карти
+    connectWS();      // підключається до WebSocket
+    requestAnimationFrame(animate);  // запускає анімаційний цикл
 };
 </script>
 </body>
