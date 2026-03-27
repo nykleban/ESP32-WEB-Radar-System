@@ -23,7 +23,7 @@ static const int angleMax = 165;
 // ── Таймінг сканування ────────────────────────────────────────────────────
 // 65 мс = 50 мс кроку + ~15 мс запас для трьох вимірів медіанного фільтра
 static const uint32_t servoStepPeriodMs = 65;
-// Час стабілізації сервомотора після переміщення на 1°
+// Час стабілізації сервомотора після переміщення на 1 градус
 static const uint32_t servoSettleMs     = 45;
 
 // ── Ультразвуковий датчик ─────────────────────────────────────────────────
@@ -153,11 +153,11 @@ static void triggerPulse() {
  * Чекає результату ISR і повертає відстань у сантиметрах.
  *
  * Використовує yield() замість busy-wait: планувальник FreeRTOS отримує
- * керування під час очікування ехо, що дозволяє WiFi- та TCP-стеку
+ * керування під час очікування ехо, що дозволяє WiFi та TCP-стеку
  * продовжувати роботу без затримок (критично для AsyncWebServer).
  *
- * Повертає 999, якщо ехо не прийшло в межах pulseTimeoutUs (об'єкт
- * поза зоною дії або відбиття відсутнє).
+ * Повертає 999, якщо ехо не прийшло в межах pulseTimeoutUs 
+ * (об'єкт поза зоною дії або відбиття відсутнє).
  */
 static int readEchoCm() {
     uint32_t deadline = micros() + pulseTimeoutUs + 500;
@@ -174,13 +174,13 @@ static int readEchoCm() {
  * Медіанний фільтр з трьох вимірів.
  *
  * Датчик HC-SR04 схильний до хибних спрацювань через:
- *   - відбиття під кутом >15° від поверхні
+ *   - відбиття під кутом > 15 градус від поверхні
  *   - перехресні акустичні завади
  *   - вібрацію механічних елементів
  *
  * Три послідовних виміри з паузою 300 мкс між ними → сортування мережею
  * (3 порівняння, оптимально для 3 елементів) → повертається медіана.
- * Загальний час: ≤ 18 мс (вміщується в 45 мс servoSettleMs).
+ * Загальний час: <= 18 мс (вміщується в 45 мс servoSettleMs).
  */
 static int measureFiltered() {
     int s[3];
@@ -190,9 +190,21 @@ static int measureFiltered() {
         if (i < 2) delayMicroseconds(300);
     }
     // Сортуюча мережа для 3 елементів (3 порівняння, без циклів)
-    if (s[0] > s[1]) { int t = s[0]; s[0] = s[1]; s[1] = t; }
-    if (s[1] > s[2]) { int t = s[1]; s[1] = s[2]; s[2] = t; }
-    if (s[0] > s[1]) { int t = s[0]; s[0] = s[1]; s[1] = t; }
+    if (s[0] > s[1]) { 
+        int t = s[0]; 
+        s[0] = s[1]; 
+        s[1] = t;
+    }
+    if (s[1] > s[2]) { 
+        int t = s[1]; 
+        s[1] = s[2]; 
+        s[2] = t; 
+    }
+    if (s[0] > s[1]) { 
+        int t = s[0]; 
+        s[0] = s[1]; 
+        s[1] = t; 
+    }
     return s[1];  // медіана
 }
 
@@ -206,7 +218,7 @@ static int measureFiltered() {
  * ws.textAll() надсилає пакет усім активним клієнтам одночасно.
  *
  * Формат пакету:
- *   { "a": кут°, "d": відстань_см, "dir": напрямок, "t": час_мс, "z": зона }
+ *   { "a": кут градус, "d": відстань_см, "dir": напрямок, "t": час_мс, "z": зона }
  *
  * Поле "z" (зона):
  *   0 — безпечно або об'єкт відсутній
@@ -286,7 +298,7 @@ void loop() {
         lastCleanupMs = now;
     }
 
-    // Крок сервомотора: рухаємось на 1° кожні servoStepPeriodMs мс
+    // Крок сервомотора: рухаємось на 1 градус кожні servoStepPeriodMs мс
     if (!waitingSettle && (now - lastServoStepMs >= servoStepPeriodMs)) {
         lastServoStepMs = now;
 
@@ -318,10 +330,8 @@ void loop() {
         if (now - lastLogMs >= 1000) {
             lastLogMs = now;
             Serial.printf("[RADAR] ang=%d dir=%+d dist=%dcm clients=%u sta=%s\n",
-                          currentAngle, scanDir, dist, ws.count(),
-                          WiFi.status() == WL_CONNECTED
-                              ? WiFi.localIP().toString().c_str()
-                              : "no");
+                 currentAngle, scanDir, dist, ws.count(),
+                 WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "no");
         }
 
         sendRadar(currentAngle, dist, scanDir, movedAtMs);
