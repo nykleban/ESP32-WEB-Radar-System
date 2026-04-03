@@ -97,7 +97,7 @@ static void startWifi() {
     // Коротка затримка для гарантованого скидання WiFi-стека ESP32.
     // Знаходиться в setup(), тому не блокує основний робочий цикл loop().
     delay(100);
-    WiFi.mode(WIFI_AP_STA);
+    // WiFi.mode(WIFI_AP_STA);
     WiFi.setSleep(false);
 
     // Канал AP тепер обирається автоматично.
@@ -107,7 +107,7 @@ static void startWifi() {
     WiFi.softAP(AP_SSID, AP_PASS);
     Serial.printf("[WiFi] AP started  IP: %s\n",
                   WiFi.softAPIP().toString().c_str());
-    startSta();
+    // startSta();
 }
 
 static void updateStaConnect() {
@@ -277,7 +277,7 @@ void setup() {
 
 // ── Loop ───────────────────────────────────────────────────────────────────
 void loop() {
-    updateStaConnect();
+    // updateStaConnect();
     uint32_t now = millis();
 
     // Очистка відключених WS-клієнтів раз на 500 мс
