@@ -831,7 +831,27 @@ document.getElementById("clearHeatmap").addEventListener("click", () => {
 
 ---
 
-## 13. Залежності та збірка
+## 13. Візуальні матеріали
+
+### Фото прототипу
+
+![Assembled ESP32 radar device](IMAGES/esp32_radar_assembled_device_front.jpg)
+
+![Ultrasonic sensor close-up](IMAGES/esp32_radar_ultrasonic_sensor_closeup.jpg)
+
+![Live test with web interface](IMAGES/esp32_radar_live_test_with_web_interface.jpg)
+
+### Схема, інтерфейс і корпус
+
+![Wiring schematic](IMAGES/esp32_radar_wiring_schematic.png)
+
+![Warning detection view](IMAGES/esp32_radar_warning_detection_view.png)
+
+![Scan history](IMAGES/esp32_radar_scan_history.png)
+
+![3D case view](IMAGES/esp32_radar_3d_case_view.png)
+
+## 14. Залежності та збірка
 
 ### platformio.ini
 
@@ -868,6 +888,10 @@ pio device monitor
 
 ```
 ESP32-WEB-Radar-System/
+├── IMAGES/
+│   ├── esp32_radar_assembled_device_front.jpg
+│   ├── esp32_radar_live_test_with_web_interface.jpg
+│   └── esp32_radar_wiring_schematic.png
 ├── src/
 │   └── main.cpp          # прошивка ESP32
 ├── data/
